@@ -9,9 +9,6 @@ import joblib
 from fastapi import FastAPI
 import uvicorn
 
-# =============================
-# 1. ساخت دیتاست نمونه (300 ردیف)
-# =============================
 spam_texts = [
     "Congratulations! You won a free lottery ticket.",
     "Claim your free prize now!!!",
@@ -31,11 +28,7 @@ ham_texts = [
 data = pd.DataFrame({
     "text": spam_texts + ham_texts,
     "label": [1] * 300 + [0] * 300  # 1=spam, 0=ham
-})
 
-# =============================
-# 2. پردازش و آموزش مدل
-# =============================
 X_train, X_test, y_train, y_test = train_test_split(
     data["text"], data["label"], test_size=0.2, random_state=42
 )
@@ -50,15 +43,9 @@ clf.fit(X_train_tfidf, y_train)
 y_pred = clf.predict(X_test_tfidf)
 print(classification_report(y_test, y_pred))
 
-# =============================
-# 3. ذخیره مدل و وکتورایزر
-# =============================
 joblib.dump(clf, "spam_model.pkl")
 joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
 
-# =============================
-# 4. API با FastAPI
-# =============================
 app = FastAPI()
 
 clf = joblib.load("spam_model.pkl")
