@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+zimbra_spam_cleaner.py
+Connects to Zimbra via IMAP, classifies messages as spam/ham, and deletes or moves spam.
+Two classification modes:
+ - heuristic: simple rule-based (no external deps)
+ - model: uses a trained sklearn model and vectorizer (pickle files)
+
+Usage examples:
+  python zimbra_spam_cleaner.py --host mail.example.com --user you@example.com --password secret \
+    --mailbox INBOX --mode heuristic --dry-run
+
+  python zimbra_spam_cleaner.py --host mail.example.com --user you@example.com --password secret \
+    --mailbox INBOX --mode model --model-path ./spam_model.pkl --vec-path ./vectorizer.pkl
+"""
+import imaplib
+import email
+from email.header import decode_header
+import argparse
+import logging
+import re
+import sys
+import pickle
+from typing import Optional, List
+
+# Optional sklearn imports
+try:
+    from sklearn.base import BaseEstimator
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+
+def connect_imap(host: str, port: int, user: str, password: str, use_ssl: bool = True, timeout: int = 30):
+    logging.info(f"Connecting to IMAP {host}:{port} SSL={use_ssl} as {user}")
+    if use_ssl:
+        M = imaplib.IMAP4_SSL(host, port)
+    else:
+        M = imaplib.IMAP4(host, port)
+    M.login(user, password)
+    return M
+
+
+def decode_mime_words(s: Optional[bytes]) -> str:
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        try:
+            s = s.decode('utf-8', errors='ignore')
+        except Exception:
+            s = s.decode('latin1', errors='ignore')
+    parts = decode_header(s)
+    out = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            try:
+                out.append(part.decode(enc or 'utf-8', errors='ignore'))
+            except Exception:
+                out.append(part.decode('latin1', errors='ignore'))
+        else:
+            out.append(part)
+    return "".join(out)
+
+
+def extract_text_from_message(msg: email.message.Message) -> str:
+    texts = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get('Content-Disposition') or "")
+            if ctype == 'text/plain' and 'attachment' not in disp:
+                try:
+                    payload = part.get_payload(decode=True)
+                    texts.append(payload.decode(part.get_content_charset() or 'utf-8', errors='ignore'))
+                except Exception:
+                    texts.append(str(part.get_payload(decode=True)))
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            texts.append(payload.decode(msg.get_content_charset() or 'utf-8', errors='ignore'))
+        except Exception:
+            texts.append(str(msg.get_payload(decode=True)))
+    # fallback to subject if body empty
+    body = "\n".join(t for t in texts if t).strip()
+    return body
+
+
+# ---------------------------
+# Heuristic classifier (simple, no deps)
+# ---------------------------
+SPAM_WORDS = [
+    'free', 'win', 'winner', 'congrat', 'urgent', 'lottery', 'prize', 'credit', 'loan',
+    'buy now', 'limited time', 'act now', 'click here', 'offer', 'guarantee', 'risk free',
+    'cheap', 'earn money', 'investment', 'unsubscribe', 'unsubscribe', 'password', 'viagra'
+]
+
+URL_RE = re.compile(r'https?://|www\.')
+
+def heuristic_is_spam(subject: str, body: str) -> bool:
+    s = (subject or "") + " " + (body or "")
+    s_lower = s.lower()
+    score = 0
+    # keyword hits
+    for w in SPAM_WORDS:
+        if w in s_lower:
+            score += 2
+    # many URLs => suspicious
+    urls = len(URL_RE.findall(s_lower))
+    if urls >= 2:
+        score += 3
+    # suspicious punctuation / all caps subject
+    if subject and subject.isupper() and len(subject) > 5:
+        score += 2
+    # too short body with suspicious words
+    if len(body or "") < 30 and any(k in s_lower for k in ['click', 'unsubscribe', 'link']):
+        score += 2
+    return score >= 3
+
+
+# ---------------------------
+# Model classifier (load sklearn model and vectorizer)
+# ---------------------------
+def load_model(model_path: str, vec_path: str):
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn not available in environment. Install scikit-learn to use model mode.")
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
+    with open(vec_path, 'rb') as f:
+        vec = pickle.load(f)
+    # basic checks
+    if not hasattr(model, 'predict'):
+        raise RuntimeError("Loaded model has no predict method.")
+    return model, vec
+
+
+def classify_with_model(model: 'BaseEstimator', vectorizer, subject: str, body: str) -> bool:
+    text = (subject or "") + " " + (body or "")
+    X = vectorizer.transform([text])
+    pred = model.predict(X)[0]
+    # assume model: 1 = spam, 0 = ham OR strings 'spam'/'ham'
+    if isinstance(pred, str):
+        return pred.lower() in ('spam', '1', 'true', 't')
+    try:
+        return bool(int(pred))
+    except Exception:
+        return pred == 1
+
+
+# ---------------------------
+# IMAP operations
+# ---------------------------
+def mailbox_exists(M: imaplib.IMAP4, mailbox: str) -> bool:
+    typ, data = M.list(directory=mailbox)
+    return typ == 'OK' and data and any(mailbox in (d.decode() if isinstance(d, bytes) else d) for d in data)
+
+
+def ensure_trash_folder(M: imaplib.IMAP4, trash_name: str = "Trash") -> str:
+    # Try common names: "Trash", "INBOX.Trash", "Deleted Items"
+    for name in [trash_name, "INBOX.Trash", "Deleted Items", "INBOX/Trash"]:
+        typ, data = M.list('""', name)
+        if typ == 'OK' and data and data[0]:
+            return name
+    # fallback to create Trash
+    try:
+        M.create(trash_name)
+        return trash_name
+    except Exception:
+        return trash_name  # best effort
+
+
+def process_mailbox(M: imaplib.IMAP4, mailbox: str, mode: str, model=None, vectorizer=None,
+                    dry_run: bool = True, limit: Optional[int] = None, move_to_trash: bool = True):
+    logging.info(f"Selecting mailbox {mailbox}")
+    typ, _ = M.select(f'"{mailbox}"')
+    if typ != 'OK':
+        raise RuntimeError(f"Failed to select mailbox {mailbox}: {typ}")
+    # search all unseen OR all messages? We'll check all messages (you can customize)
+    typ, data = M.search(None, "ALL")
+    if typ != 'OK':
+        logging.error("Search failed")
+        return
+    uids = data[0].split()
+    logging.info(f"Found {len(uids)} messages in {mailbox}")
+    processed = 0
+    trash_folder = ensure_trash_folder(M)
+    for i, uid in enumerate(reversed(uids)):  # newest first
+        if limit and processed >= limit:
+            break
+        try:
+            typ, msg_data = M.fetch(uid, '(RFC822)')
+            if typ != 'OK':
+                logging.warning(f"Failed to fetch UID {uid}")
+                continue
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+            subject = decode_mime_words(msg.get("Subject"))
+            body = extract_text_from_message(msg)
+            is_spam = False
+            if mode == 'heuristic':
+                is_spam = heuristic_is_spam(subject, body)
+            else:
+                is_spam = classify_with_model(model, vectorizer, subject, body)
+            logging.info(f"UID {uid.decode() if isinstance(uid, bytes) else uid}: Subject='{subject[:60]}' => spam={is_spam}")
+            if is_spam:
+                if dry_run:
+                    logging.info(f"[DRY-RUN] Would remove UID {uid}")
+                else:
+                    # Move to Trash (COPY then mark Deleted and expunge) — IMAP MOVE may be supported but not by all servers
+                    try:
+                        # Try MOVE command (RFC 6851) if server supports it
+                        typ_move = None
+                        if 'MOVE' in M.capabilities:
+                            typ_move, _ = M.uid('MOVE', uid, trash_folder)
+                        if typ_move and typ_move == 'OK':
+                            logging.info(f"Moved UID {uid} to {trash_folder} via MOVE")
+                        else:
+                            # fallback: COPY then STORE +FLAGS \Deleted
+                            typc, _ = M.uid('COPY', uid, trash_folder)
+                            if typc != 'OK':
+                                logging.warning(f"Failed to copy UID {uid} to {trash_folder}")
+                            else:
+                                M.uid('STORE', uid, '+FLAGS', r'(\Deleted)')
+                                logging.info(f"Copied + flagged Deleted UID {uid}; will EXPUNGE")
+                    except Exception as e:
+                        logging.error(f"Error moving/deleting UID {uid}: {e}")
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user")
+            break
+        except Exception as e:
+            logging.exception(f"Error processing UID {uid}: {e}")
+        processed += 1
+    if not dry_run:
+        # expunge to permanently remove flagged messages
+        logging.info("Expunging mailbox to finalize deletions")
+        M.expunge()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Zimbra spam detector + remover via IMAP")
+    parser.add_argument("--host", required=True, help="IMAP host (Zimbra server)")
+    parser.add_argument("--port", type=int, default=993, help="IMAP port (default 993 for SSL)")
+    parser.add_argument("--user", required=True, help="IMAP username")
+    parser.add_argument("--password", required=True, help="IMAP password")
+    parser.add_argument("--mailbox", default="INBOX", help="Mailbox to scan (default INBOX)")
+    parser.add_argument("--mode", choices=("heuristic", "model"), default="heuristic", help="Classification mode")
+    parser.add_argument("--model-path", help="Path to pickled sklearn model (required if mode=model)")
+    parser.add_argument("--vec-path", help="Path to pickled vectorizer (required if mode=model)")
+    parser.add_argument("--dry-run", action="store_true", help="Do not delete/move messages; just report (recommended first run)")
+    parser.add_argument("--limit", type=int, help="Limit number of messages to process (for testing)")
+    parser.add_argument("--no-ssl", action="store_true", help="Disable SSL (use with caution)")
+    args = parser.parse_args()
+
+    model = vectorizer = None
+    if args.mode == 'model':
+        if not (args.model_path and args.vec_path):
+            logging.error("Model mode requires --model-path and --vec-path")
+            sys.exit(1)
+        model, vectorizer = load_model(args.model_path, args.vec_path)
+        logging.info("Loaded model and vectorizer")
+
+    M = connect_imap(args.host, args.port, args.user, args.password, use_ssl=not args.no_ssl)
+    try:
+        process_mailbox(M, args.mailbox, args.mode, model=model, vectorizer=vectorizer,
+                        dry_run=args.dry_run, limit=args.limit)
+    finally:
+        logging.info("Logging out")
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
